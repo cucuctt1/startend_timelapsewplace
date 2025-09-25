@@ -502,7 +502,6 @@ def main_page():
                 <h3>System Status</h3>
                 <p><strong>Configuration:</strong></p>
                 <ul>
-                    <li>Tile coordinates: ({{ cord1[0] }},{{ cord1[1] }}) to ({{ cord2[0] }},{{ cord2[1] }})</li>
                     <li>Grid size: {{ numx }} × {{ numy }} tiles</li>
                     <li>Capture interval: {{ interval }} seconds ({{ interval_min }} minutes)</li>
                     <li>Video FPS: {{ fps }}</li>
