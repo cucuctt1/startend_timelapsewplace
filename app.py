@@ -30,8 +30,8 @@ numx = TendX - TstartX + 1
 numy = TendY - TstartY + 1
 
 output_file = "output.mp4"
-interval = 1800  # 30 minutes
-fps = 8
+interval = int(os.getenv("INTERVAL", 1800))  # default 30 min
+fps = int(os.getenv("FPS", 2))     
 
 # ---------------- IMAGE FUNCTIONS ----------------
 def merge_chunks(chunks, rows, cols, chunk_h, chunk_w):
