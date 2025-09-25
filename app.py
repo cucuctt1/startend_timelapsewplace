@@ -747,7 +747,6 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("🚀 Starting Timelapse Generator Application")
     logger.info(f"Configuration loaded:")
-    logger.info(f"  - Coordinates: ({cord1[0]},{cord1[1]}) to ({cord2[0]},{cord2[1]})")
     logger.info(f"  - Grid size: {numx} × {numy} tiles")
     logger.info(f"  - Capture interval: {interval} seconds ({interval // 60} minutes)")
     logger.info(f"  - Video FPS: {fps}")
