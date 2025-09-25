@@ -5,9 +5,12 @@ from io import BytesIO
 import cv2
 import time
 import threading
-from flask import Flask, send_file, render_template_string
+from flask import Flask, send_file, render_template_string, jsonify
+from flask_sqlalchemy import SQLAlchemy
 import logging
 from datetime import datetime
+import base64
+import json
 
 import os
 
@@ -43,6 +46,216 @@ class LogHandler(logging.Handler):
 # Add custom handler to capture logs
 log_handler = LogHandler()
 logger.addHandler(log_handler)
+
+# ---------------- DATABASE SETUP ----------------
+# Initialize Flask app early for database setup
+app = Flask(__name__)
+
+# Database configuration for PostgreSQL (Render compatible)
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///timelapse.db')
+# Fix for Render PostgreSQL URL format
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+try:
+    db = SQLAlchemy(app)
+    logger.info(f"Database connected: {DATABASE_URL.split('@')[0].split('//')[1] if '@' in DATABASE_URL else 'SQLite'}")
+    
+    # Database Models
+    class FrameData(db.Model):
+        __tablename__ = 'frame_data'
+        
+        id = db.Column(db.Integer, primary_key=True)
+        timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+        frame_number = db.Column(db.Integer, unique=True, nullable=False, index=True)
+        image_data = db.Column(db.LargeBinary, nullable=False)  # Compressed PNG data
+        width = db.Column(db.Integer, nullable=False)
+        height = db.Column(db.Integer, nullable=False)
+        file_size = db.Column(db.Integer, nullable=False)  # Size in bytes
+        created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+        
+        def __repr__(self):
+            return f'<FrameData {self.frame_number} at {self.timestamp}>'
+
+    class VideoMetadata(db.Model):
+        __tablename__ = 'video_metadata'
+        
+        id = db.Column(db.Integer, primary_key=True)
+        video_name = db.Column(db.String(255), nullable=False)
+        total_frames = db.Column(db.Integer, default=0)
+        fps = db.Column(db.Integer, nullable=False)
+        width = db.Column(db.Integer, nullable=False)
+        height = db.Column(db.Integer, nullable=False)
+        interval_seconds = db.Column(db.Integer, nullable=False)
+        created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+        updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+        is_complete = db.Column(db.Boolean, default=False)
+        file_path = db.Column(db.String(500))
+        
+        def __repr__(self):
+            return f'<VideoMetadata {self.video_name} - {self.total_frames} frames>'
+    
+except Exception as e:
+    logger.error(f"Database setup failed: {e}")
+    db = None
+    FrameData = None
+    VideoMetadata = None
+
+# Database helper functions
+def save_frame_to_db(frame_image, frame_number):
+    """Save frame image to database as compressed PNG"""
+    try:
+        if db is None or FrameData is None:
+            logger.warning("Database not available, skipping frame save")
+            return None
+            
+        # Convert frame to PNG bytes
+        img_buffer = BytesIO()
+        frame_pil = Image.fromarray(cv2.cvtColor(frame_image, cv2.COLOR_BGR2RGB))
+        frame_pil.save(img_buffer, format='PNG', optimize=True, compress_level=6)
+        img_data = img_buffer.getvalue()
+        
+        height, width = frame_image.shape[:2]
+        
+        # Check if frame already exists
+        existing_frame = FrameData.query.filter_by(frame_number=frame_number).first()
+        if existing_frame:
+            logger.warning(f"Frame {frame_number} already exists in database, skipping")
+            return existing_frame
+        
+        # Create new frame record
+        frame_record = FrameData(
+            frame_number=frame_number,
+            image_data=img_data,
+            width=width,
+            height=height,
+            file_size=len(img_data),
+            timestamp=datetime.utcnow()
+        )
+        
+        db.session.add(frame_record)
+        db.session.commit()
+        
+        logger.info(f"💾 Saved frame {frame_number} to database ({len(img_data) // 1024} KB)")
+        return frame_record
+        
+    except Exception as e:
+        logger.error(f"Failed to save frame {frame_number} to database: {e}")
+        try:
+            if db:
+                db.session.rollback()
+        except:
+            pass  # Ignore rollback errors
+        return None
+
+def get_frame_from_db(frame_number):
+    """Retrieve frame image from database"""
+    try:
+        if db is None or FrameData is None:
+            return None
+            
+        frame_record = FrameData.query.filter_by(frame_number=frame_number).first()
+        if not frame_record:
+            return None
+        
+        # Convert PNG bytes back to OpenCV format
+        img_buffer = BytesIO(frame_record.image_data)
+        pil_image = Image.open(img_buffer)
+        frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        
+        return frame
+    except Exception as e:
+        logger.error(f"Failed to retrieve frame {frame_number} from database: {e}")
+        return None
+
+def get_all_frames_count():
+    """Get total number of frames in database"""
+    try:
+        if db is None or FrameData is None:
+            return 0
+        return FrameData.query.count()
+    except Exception as e:
+        logger.error(f"Failed to count frames: {e}")
+        return 0
+
+def create_video_from_db_frames(output_filename=None):
+    """Create video from all frames stored in database"""
+    if not output_filename:
+        output_filename = f"timelapse_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+    
+    try:
+        if db is None or FrameData is None:
+            logger.warning("Database not available, cannot create video from frames")
+            return None
+            
+        # Get all frames ordered by frame number
+        frames = FrameData.query.order_by(FrameData.frame_number).all()
+        
+        if not frames:
+            logger.warning("No frames found in database to create video")
+            return None
+        
+        logger.info(f"🎬 Creating video from {len(frames)} database frames")
+        
+        # Get video parameters from first frame
+        first_frame_img = get_frame_from_db(frames[0].frame_number)
+        if first_frame_img is None:
+            logger.error("Failed to load first frame from database")
+            return None
+        
+        height, width = first_frame_img.shape[:2]
+        
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
+        
+        # Write all frames to video
+        for i, frame_record in enumerate(frames):
+            frame_img = get_frame_from_db(frame_record.frame_number)
+            if frame_img is not None:
+                video_writer.write(frame_img)
+                if (i + 1) % 10 == 0:
+                    logger.info(f"📹 Processed frame {i + 1}/{len(frames)}")
+            else:
+                logger.warning(f"Skipped corrupted frame {frame_record.frame_number}")
+        
+        video_writer.release()
+        
+        # Update video metadata if available
+        if VideoMetadata is not None:
+            try:
+                video_meta = VideoMetadata.query.first()
+                if not video_meta:
+                    video_meta = VideoMetadata(
+                        video_name=output_filename,
+                        total_frames=len(frames),
+                        fps=fps,
+                        width=width,
+                        height=height,
+                        interval_seconds=interval,
+                        file_path=output_filename,
+                        is_complete=True
+                    )
+                    db.session.add(video_meta)
+                else:
+                    video_meta.total_frames = len(frames)
+                    video_meta.updated_at = datetime.utcnow()
+                    video_meta.is_complete = True
+                    video_meta.file_path = output_filename
+                
+                db.session.commit()
+            except Exception as meta_error:
+                logger.warning(f"Failed to update video metadata: {meta_error}")
+        
+        logger.info(f"🎉 Video created successfully: {output_filename}")
+        return output_filename
+        
+    except Exception as e:
+        logger.error(f"Failed to create video from database frames: {e}")
+        return None
 
 def get_coords(env_name):
     val = os.getenv(env_name)
@@ -90,13 +303,12 @@ def build_snapshot():
     for y in range(TstartY, TendY+1):
         for x in range(TstartX, TendX+1):
             url = URL.format(x, y)
-            print(f"Downloading tile {x},{y}")
             res = requests.get(url)
             if res.status_code == 200:
                 data_array.append(BytesIO(res.content))
             else:
                 failed_tiles += 1
-                logger.warning(f"Failed to download tile {x},{y} - status code: {res.status_code}")
+                logger.warning(f"Failed to download tile - status code: {res.status_code}")
                 # Create a placeholder image as BytesIO instead of PIL Image
                 placeholder = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0,0,0,0))
                 placeholder_bytes = BytesIO()
@@ -131,9 +343,17 @@ def rgba_to_rgb_with_bg(img, bg_color=(158, 189, 255)):
 def run_video_loop():
     frame_size = None
     video = None
-    frame_count = 0
+    
+    # Initialize frame count with app context
+    with app.app_context():
+        try:
+            frame_count = get_all_frames_count()  # Resume from database count
+        except Exception as e:
+            logger.warning(f"Could not get frame count from database: {e}")
+            frame_count = 0
 
     logger.info(f"Starting timelapse video loop - interval: {interval}s, fps: {fps}")
+    logger.info(f"Resuming from frame count: {frame_count}")
     
     try:
         while True:
@@ -149,27 +369,44 @@ def run_video_loop():
             if frame_size is None:
                 height, width, _ = frame.shape
                 frame_size = (width, height)
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                video = cv2.VideoWriter(output_file, fourcc, fps, frame_size)
-                logger.info(f"Initialized video writer - resolution: {width}x{height}, fps: {fps}")
+                logger.info(f"Frame dimensions: {width}x{height}, fps: {fps}")
 
-            video.write(frame)
+            # Save frame to database (primary storage) with app context
             frame_count += 1
-            logger.info(f"✅ Added frame #{frame_count} to {output_file}")
-            print(f"✅ Added frame to {output_file}")
+            with app.app_context():
+                try:
+                    saved_frame = save_frame_to_db(frame, frame_count)
+                    
+                    if saved_frame:
+                        logger.info(f"✅ Saved frame #{frame_count} to database")
+                        print(f"✅ Added frame #{frame_count} to database")
+                        
+                        # Optionally create/update video file every N frames or on schedule
+                        if frame_count % 10 == 0:  # Every 10 frames, recreate video
+                            logger.info("Recreating video from database frames...")
+                            video_file = create_video_from_db_frames(output_file)
+                            if video_file:
+                                logger.info(f"📹 Video updated: {video_file}")
+                    else:
+                        logger.error(f"Failed to save frame #{frame_count}")
+                except Exception as db_error:
+                    logger.error(f"Database error for frame #{frame_count}: {db_error}")
+                    # Continue without database if there's an error
+                    logger.info(f"✅ Captured frame #{frame_count} (database unavailable)")
+                    print(f"✅ Captured frame #{frame_count} (database unavailable)")
 
             logger.info(f"Waiting {interval} seconds until next frame")
             time.sleep(interval)  # wait for the specified interval
+            
     except Exception as e:
         logger.error(f"Error in video loop: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
     finally:
-        if video:
-            video.release()
-            logger.info(f"🎬 Video finalized with {frame_count} frames")
-            print("🎬 Video finalized.")
+        logger.info(f"🎬 Video loop stopped after {frame_count} frames")
+        print("🎬 Video loop finalized.")
 
-# ---------------- FLASK APP ----------------
-app = Flask(__name__)
+# ---------------- FLASK APP ROUTES ----------------
 
 @app.route("/")
 def main_page():
@@ -269,14 +506,26 @@ def main_page():
                     <li>Grid size: {{ numx }} × {{ numy }} tiles</li>
                     <li>Capture interval: {{ interval }} seconds ({{ interval_min }} minutes)</li>
                     <li>Video FPS: {{ fps }}</li>
-                    <li>Total frames captured: Available in logs</li>
+                    <li>Database: {{ database_type }}</li>
+                </ul>
+                
+                <p><strong>Database Statistics:</strong></p>
+                <ul>
+                    <li>Total frames stored: <span id="total-frames">{{ db_stats.total_frames }}</span></li>
+                    <li>Latest frame: #<span id="latest-frame">{{ db_stats.latest_frame }}</span></li>
+                    <li>Database size: <span id="db-size">{{ db_stats.db_size_mb }}</span> MB</li>
+                    <li>Video status: <span id="video-status">{{ "✅ Ready" if db_stats.video_exists else "⏳ Generating" }}</span></li>
                 </ul>
             </div>
             
             <div class="controls">
                 <a href="/download" class="btn">📥 Download Video</a>
+                <button onclick="rebuildVideo()" class="btn">🔨 Rebuild Video</button>
+                <button onclick="refreshStats()" class="btn">📊 Refresh Stats</button>
                 <button onclick="location.reload()" class="btn">🔄 Refresh Logs</button>
             </div>
+            
+            <div id="rebuild-status" style="margin: 10px 0; padding: 10px; border-radius: 5px; display: none;"></div>
             
             <h3>📋 Application Logs</h3>
             <div class="logs">
@@ -304,14 +553,96 @@ def main_page():
             const logsContainer = document.querySelector('.logs');
             logsContainer.scrollTop = logsContainer.scrollHeight;
             
-            // Auto-refresh every 30 seconds
+            // Refresh database statistics
+            function refreshStats() {
+                fetch('/api/stats')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('total-frames').textContent = data.total_frames;
+                        document.getElementById('latest-frame').textContent = data.latest_frame_number;
+                        document.getElementById('db-size').textContent = data.database_size_mb;
+                        document.getElementById('video-status').textContent = data.video_exists ? '✅ Ready' : '⏳ Generating';
+                    })
+                    .catch(error => console.error('Error refreshing stats:', error));
+            }
+            
+            // Rebuild video from database
+            function rebuildVideo() {
+                const statusDiv = document.getElementById('rebuild-status');
+                statusDiv.style.display = 'block';
+                statusDiv.style.background = '#fff3cd';
+                statusDiv.style.border = '1px solid #ffeaa7';
+                statusDiv.style.color = '#856404';
+                statusDiv.textContent = '🔨 Rebuilding video from database frames...';
+                
+                fetch('/api/rebuild_video')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            statusDiv.style.background = '#d4edda';
+                            statusDiv.style.border = '1px solid #c3e6cb';
+                            statusDiv.style.color = '#155724';
+                            statusDiv.textContent = `✅ ${data.message} (${data.total_frames} frames)`;
+                            refreshStats();
+                        } else {
+                            statusDiv.style.background = '#f8d7da';
+                            statusDiv.style.border = '1px solid #f5c6cb';
+                            statusDiv.style.color = '#721c24';
+                            statusDiv.textContent = `❌ Error: ${data.message}`;
+                        }
+                        
+                        setTimeout(() => {
+                            statusDiv.style.display = 'none';
+                        }, 5000);
+                    })
+                    .catch(error => {
+                        statusDiv.style.background = '#f8d7da';
+                        statusDiv.style.border = '1px solid #f5c6cb';
+                        statusDiv.style.color = '#721c24';
+                        statusDiv.textContent = `❌ Network error: ${error.message}`;
+                        
+                        setTimeout(() => {
+                            statusDiv.style.display = 'none';
+                        }, 5000);
+                    });
+            }
+            
+            // Auto-refresh stats every 15 seconds
+            setInterval(refreshStats, 15000);
+            
+            // Auto-refresh page every 60 seconds
             setTimeout(function() {
                 location.reload();
-            }, 30000);
+            }, 60000);
         </script>
     </body>
     </html>
     """
+    
+    # Get database statistics
+    try:
+        db_stats = {
+            'total_frames': get_all_frames_count(),
+            'latest_frame': 0,
+            'db_size_mb': get_database_size_mb(),
+            'video_exists': os.path.exists(output_file)
+        }
+        
+        if FrameData is not None:
+            latest_frame = FrameData.query.order_by(FrameData.frame_number.desc()).first()
+            if latest_frame:
+                db_stats['latest_frame'] = latest_frame.frame_number
+            
+        database_type = "PostgreSQL" if "postgresql" in DATABASE_URL else "SQLite"
+    except Exception as e:
+        logger.error(f"Error getting database stats: {e}")
+        db_stats = {
+            'total_frames': 0,
+            'latest_frame': 0,
+            'db_size_mb': 0,
+            'video_exists': os.path.exists(output_file)
+        }
+        database_type = "Unknown"
     
     return render_template_string(template, 
                                 log_entries=log_entries,
@@ -322,17 +653,96 @@ def main_page():
                                 numy=numy,
                                 interval=interval,
                                 interval_min=interval // 60,
-                                fps=fps)
+                                fps=fps,
+                                db_stats=db_stats,
+                                database_type=database_type)
 
 @app.route("/download")
 def download_video():
     """Download the generated timelapse video"""
     logger.info("User requested video download")
     try:
-        return send_file(output_file, as_attachment=True)
-    except FileNotFoundError:
-        logger.error(f"Video file {output_file} not found")
-        return "Video file not found. The timelapse may still be generating.", 404
+        # First try to create fresh video from database
+        fresh_video = create_video_from_db_frames(output_file)
+        if fresh_video and os.path.exists(fresh_video):
+            return send_file(fresh_video, as_attachment=True)
+        elif os.path.exists(output_file):
+            return send_file(output_file, as_attachment=True)
+        else:
+            return "Video file not found. The timelapse may still be generating.", 404
+    except Exception as e:
+        logger.error(f"Error serving video file: {e}")
+        return f"Error generating video: {str(e)}", 500
+
+@app.route("/api/stats")
+def api_stats():
+    """API endpoint for database statistics"""
+    try:
+        total_frames = get_all_frames_count()
+        
+        latest_frame = None
+        if FrameData is not None:
+            latest_frame = FrameData.query.order_by(FrameData.frame_number.desc()).first()
+            
+        video_meta = None
+        if VideoMetadata is not None:
+            video_meta = VideoMetadata.query.first()
+        
+        stats = {
+            'total_frames': total_frames,
+            'latest_frame_number': latest_frame.frame_number if latest_frame else 0,
+            'latest_frame_time': latest_frame.timestamp.isoformat() if latest_frame else None,
+            'database_size_mb': get_database_size_mb(),
+            'video_exists': os.path.exists(output_file),
+            'video_metadata': {
+                'total_frames': video_meta.total_frames if video_meta else 0,
+                'fps': video_meta.fps if video_meta else fps,
+                'is_complete': video_meta.is_complete if video_meta else False,
+                'last_updated': video_meta.updated_at.isoformat() if video_meta else None
+            } if video_meta else None
+        }
+        
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route("/api/rebuild_video")
+def rebuild_video():
+    """Force rebuild video from database frames"""
+    logger.info("User requested video rebuild from database")
+    try:
+        video_file = create_video_from_db_frames(output_file)
+        if video_file:
+            return jsonify({
+                'success': True, 
+                'message': f'Video rebuilt successfully: {video_file}',
+                'total_frames': get_all_frames_count()
+            })
+        else:
+            return jsonify({'success': False, 'message': 'Failed to rebuild video'}), 500
+    except Exception as e:
+        logger.error(f"Error rebuilding video: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+def get_database_size_mb():
+    """Get approximate database size in MB"""
+    try:
+        if db is None:
+            return 0
+            
+        if 'sqlite' in DATABASE_URL.lower():
+            db_path = DATABASE_URL.split(':///')[-1]
+            if os.path.exists(db_path):
+                return round(os.path.getsize(db_path) / (1024 * 1024), 2)
+        else:
+            # For PostgreSQL, estimate from frame data
+            if FrameData is not None:
+                total_size = db.session.query(db.func.sum(FrameData.file_size)).scalar() or 0
+                return round(total_size / (1024 * 1024), 2)
+        return 0
+    except Exception:
+        return 0
 
 if __name__ == "__main__":
     logger.info("=" * 50)
@@ -343,7 +753,34 @@ if __name__ == "__main__":
     logger.info(f"  - Capture interval: {interval} seconds ({interval // 60} minutes)")
     logger.info(f"  - Video FPS: {fps}")
     logger.info(f"  - Output file: {output_file}")
+    logger.info(f"  - Database: {DATABASE_URL.split('@')[0].split('//')[1] if '@' in DATABASE_URL else 'SQLite'}")
     logger.info("=" * 50)
+    
+    # Initialize database
+    try:
+        with app.app_context():
+            db.create_all()
+            existing_frames = get_all_frames_count()
+            logger.info(f"📊 Database initialized - {existing_frames} existing frames found")
+            
+            # Create initial video metadata if not exists
+            if VideoMetadata is not None:
+                video_meta = VideoMetadata.query.first()
+                if not video_meta:
+                    video_meta = VideoMetadata(
+                        video_name=output_file,
+                        total_frames=existing_frames,
+                        fps=fps,
+                        width=0,
+                        height=0,
+                        interval_seconds=interval,
+                        is_complete=False
+                    )
+                    db.session.add(video_meta)
+                    db.session.commit()
+                    logger.info("📝 Created initial video metadata")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
     
     # Start video loop in background
     logger.info("Starting background timelapse video generation thread")
@@ -351,5 +788,8 @@ if __name__ == "__main__":
     
     # Start Flask server
     logger.info("Starting Flask web server on http://0.0.0.0:10000")
-    logger.info("Visit the website to view real-time logs and download the timelapse video")
-    app.run(host="0.0.0.0", port=10000)
+    logger.info("🌐 Visit the website to view real-time logs, database stats, and download videos")
+    logger.info("🔄 Application will survive Render hosting restarts with database persistence")
+    
+    port = int(os.getenv('PORT', 10000))
+    app.run(host="0.0.0.0", port=port)
