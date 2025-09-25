@@ -7,9 +7,19 @@ import time
 import threading
 from flask import Flask, send_file
 
+import os
+
+def get_coords(env_name):
+    val = os.getenv(env_name)
+    if not val:
+        raise ValueError(f"Missing env var: {env_name}")
+    return tuple(map(int, val.split(",")))
+
+cord1 = get_coords("CORD1")
+cord2 = get_coords("CORD2")
+
+
 # ---------------- CONFIG ----------------
-cord1 = (1983, 1387,146,788)
-cord2 = (1985, 1388, 31, 882)
 TILE_SIZE = 1000
 URL = "https://backend.wplace.live/files/s0/tiles/{}/{}.png"
 
@@ -21,7 +31,7 @@ numy = TendY - TstartY + 1
 
 output_file = "output.mp4"
 interval = 1800  # 30 minutes
-fps = 2
+fps = 8
 
 # ---------------- IMAGE FUNCTIONS ----------------
 def merge_chunks(chunks, rows, cols, chunk_h, chunk_w):
